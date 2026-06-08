@@ -14,8 +14,14 @@ import base64
 import json
 import requests
 import urllib3
-import winsound
 from pathlib import Path
+try:
+    import winsound as _winsound
+    def _beep():
+        _winsound.MessageBeep(_winsound.MB_ICONEXCLAMATION)
+except ImportError:
+    def _beep():
+        pass  # non-Windows: no sound
 from typing import Optional
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -45,7 +51,7 @@ POLL_INTERVAL = 5  # seconds
 # ── Store constants ────────────────────────────────────────────────────────────
 VP_ID         = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
 RADIANITE_ID  = "e59aa87c-4cbf-517a-5983-6e81511be9b7"
-KC_ID         = "85ca954a-00f8-4020-ae71-bf6b0a56f52e"
+KC_ID         = "85ca954a-41f2-ce94-9b45-8ca3dd39a00d"
 # Standard base64 PC client platform string accepted by Riot's remote API
 CLIENT_PLATFORM = (
     "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0K"
@@ -54,13 +60,22 @@ CLIENT_PLATFORM = (
 )
 
 SHARD_MAP = {
-    "na": "na", "pbe": "na",
+    "na": "na", "pbe": "na", "latam": "na", "br": "na",
     "eu": "eu",
     "ap": "ap",
     "kr": "kr",
-    "latam": "na",
-    "br": "na",
 }
+
+def _region_to_shard(region: str) -> str:
+    """
+    Map a region string to its PD shard.  Riot returns variants like
+    'eu1', 'eu2', 'na1', 'ap1' etc. — strip trailing digits then look up.
+    """
+    region = region.lower().strip()
+    if region in SHARD_MAP:
+        return SHARD_MAP[region]
+    base = region.rstrip("0123456789")
+    return SHARD_MAP.get(base, "na")
 
 # ── ASCII Art Library (valoranttextart.com) ────────────────────────────────────
 ASCII_ART = {
@@ -184,25 +199,51 @@ ASCII_ART = {
 }
 
 
-# ── Skin name cache (populated lazily from valorant-api.com) ──────────────────
-_skin_cache: dict[str, str] = {}
+# ── JWT helper ────────────────────────────────────────────────────────────────
+
+def _decode_jwt(token: str) -> dict:
+    """Decode a JWT payload section without verifying the signature."""
+    try:
+        payload_b64 = token.split('.')[1]
+        payload_b64 += '=' * (-len(payload_b64) % 4)
+        return json.loads(base64.b64decode(payload_b64))
+    except Exception:
+        return {}
 
 
-def get_skin_names() -> dict[str, str]:
-    """Return a uuid→displayName map covering every skin level UUID."""
-    global _skin_cache
-    if _skin_cache:
-        return _skin_cache
-    r = requests.get("https://valorant-api.com/v1/weapons/skins", timeout=15)
-    r.raise_for_status()
-    cache: dict[str, str] = {}
-    for skin in r.json().get("data", []):
-        name = skin["displayName"]
-        cache[skin["uuid"]] = name
-        for level in skin.get("levels", []):
-            cache[level["uuid"]] = name
-    _skin_cache = cache
-    return cache
+def resolve_skin_name(level_uuid: str) -> str:
+    """
+    Look up a skin name by the exact level UUID Riot's store returns.
+    Uses the per-UUID endpoint so there is no bulk-cache mismatch risk.
+    Falls back to the skins list endpoint if the level endpoint 404s.
+    """
+    # Primary: direct level UUID lookup
+    try:
+        r = requests.get(
+            f"https://valorant-api.com/v1/weapons/skinlevels/{level_uuid}",
+            timeout=10,
+        )
+        if r.ok:
+            name = r.json().get("data", {}).get("displayName", "")
+            if name:
+                return name
+    except Exception:
+        pass
+
+    # Fallback: search the full skins list
+    try:
+        r = requests.get("https://valorant-api.com/v1/weapons/skins", timeout=15)
+        if r.ok:
+            for skin in r.json().get("data", []):
+                if skin.get("uuid") == level_uuid:
+                    return skin["displayName"]
+                for level in skin.get("levels", []):
+                    if level.get("uuid") == level_uuid:
+                        return skin["displayName"]
+    except Exception:
+        pass
+
+    return f"Unknown skin"
 
 
 # ── Lockfile / API ─────────────────────────────────────────────────────────────
@@ -259,23 +300,138 @@ class RiotAPI:
         r.raise_for_status()
         return r.json()
 
-    def get_auth_info(self) -> dict:
-        """Return accessToken, entitlementToken, and puuid from the local API."""
-        r = self._session.get(f"{self.base}/entitlements/v1/token")
+    def get_chat_session(self) -> dict:
+        """
+        /chat/v1/session is the ground-truth source for the account that is
+        actively logged into the Riot Chat system (i.e. actually playing).
+        Returns fields: puuid, game_name, game_tag, name, region.
+        """
+        r = self._session.get(f"{self.base}/chat/v1/session")
         r.raise_for_status()
-        d = r.json()
-        return {
-            "access_token":      d["accessToken"],
-            "entitlement_token": d["token"],
-            "puuid":             d["subject"],
-        }
+        return r.json()
+
+    def _try_product_auth(self, correct_puuid: str) -> Optional[dict]:
+        """
+        When /entitlements/v1/token has stale tokens for a different account,
+        try the Riot Client's product-specific RSO auth endpoints to obtain
+        tokens whose JWT subject matches correct_puuid.
+
+        Returns {access_token, entitlement_token} or None.
+        """
+        # Client IDs the Riot Client may expose product-specific tokens under
+        for client_id in ("valorant-game", "valorant", "riot_client_auth", "riot_client"):
+            try:
+                r = self._session.get(
+                    f"{self.base}/rso-auth/v2/authorizations/{client_id}"
+                )
+                if not r.ok:
+                    continue
+                d = r.json()
+                # Response shape varies by client — flatten the common locations
+                access_token = (
+                    d.get("accessToken")
+                    or d.get("access_token")
+                    or (d.get("authorization") or {}).get("accessToken", {}).get("token")
+                    or (d.get("token") or {}).get("access_token")
+                )
+                if not access_token:
+                    continue
+
+                # Only use this token if its sub actually matches the game account
+                if _decode_jwt(access_token).get("sub") != correct_puuid:
+                    continue
+
+                # Fetch a fresh entitlement JWT that is bound to this access token
+                ent_r = requests.post(
+                    "https://entitlements.auth.riotgames.com/api/token/v1",
+                    headers={
+                        "Authorization":  f"Bearer {access_token}",
+                        "Content-Type":   "application/json",
+                    },
+                    json={},
+                    timeout=10,
+                )
+                if ent_r.ok:
+                    ent_token = ent_r.json().get("entitlements_token", "")
+                    if ent_token:
+                        return {"access_token": access_token,
+                                "entitlement_token": ent_token}
+            except Exception:
+                continue
+        return None
+
+    def get_auth_info(self) -> dict:
+        """
+        Return {access_token, entitlement_token, puuid, display_name} for
+        the account that is *actually* logged into Valorant right now.
+
+        Flow:
+          1. puuid  ← /chat/v1/session          (tied to the live game session)
+          2. tokens ← /entitlements/v1/token    (fast path)
+          3. Decode the access-token JWT; if its sub == puuid we're done.
+          4. sub mismatch → the cached tokens belong to a different account.
+             Try /rso-auth/v2/authorizations/* for a Valorant-specific token,
+             then re-issue an entitlement JWT via the remote endpoint.
+          5. If everything fails, raise with a clear message.
+        """
+        chat         = self.get_chat_session()
+        correct_puuid = chat.get("puuid", "")
+        display_name  = f"{chat.get('game_name','')}#{chat.get('game_tag','')}"
+
+        ent_r = self._session.get(f"{self.base}/entitlements/v1/token")
+        ent_r.raise_for_status()
+        ent = ent_r.json()
+
+        access_token      = ent["accessToken"]
+        entitlement_token = ent["token"]
+        ent_subject       = ent.get("subject", "")          # field Riot provides directly
+        token_sub         = _decode_jwt(access_token).get("sub", "") or ent_subject
+
+        # Fast path: token belongs to the logged-in account
+        if token_sub == correct_puuid:
+            return {
+                "access_token":      access_token,
+                "entitlement_token": entitlement_token,
+                "puuid":             correct_puuid or ent.get("subject", ""),
+                "display_name":      display_name,
+            }
+
+        # Slow path: cached tokens are for a DIFFERENT account – try product auth
+        product = self._try_product_auth(correct_puuid)
+        if product:
+            return {
+                "access_token":      product["access_token"],
+                "entitlement_token": product["entitlement_token"],
+                "puuid":             correct_puuid,
+                "display_name":      display_name,
+            }
+
+        # Nothing worked – raise a clear, actionable error
+        raise RuntimeError(
+            f"Auth token mismatch.\n\n"
+            f"The Riot Client's cached token belongs to a different account "
+            f"(sub: …{token_sub[-8:]}) than the one playing Valorant "
+            f"(puuid: …{correct_puuid[-8:]}).\n\n"
+            "Fix: close ALL Riot Client windows, reopen, and log in with only "
+            "your main account before launching ValASCII."
+        )
 
     def get_region(self) -> tuple[str, str]:
-        """Return (region, shard) e.g. ('na', 'na') or ('eu', 'eu')."""
-        r = self._session.get(f"{self.base}/riotclient/region-locale")
+        """
+        Return (region, shard).  /chat/v1/session is primary because it
+        is tied to the active game session; falls back to region-locale.
+        """
+        try:
+            chat   = self.get_chat_session()
+            region = chat.get("region", "").lower()
+            if region:
+                return region, _region_to_shard(region)
+        except Exception:
+            pass
+        r      = self._session.get(f"{self.base}/riotclient/region-locale")
         r.raise_for_status()
         region = r.json().get("region", "na").lower()
-        return region, SHARD_MAP.get(region, "na")
+        return region, _region_to_shard(region)
 
     def get_shop(self) -> dict:
         """
@@ -293,20 +449,18 @@ class RiotAPI:
         ver_r.raise_for_status()
         client_version = ver_r.json()["data"]["riotClientVersion"]
 
-        skin_names = get_skin_names()
-
         remote_headers = {
-            "X-Riot-ClientPlatform":  CLIENT_PLATFORM,
-            "X-Riot-ClientVersion":   client_version,
+            "X-Riot-ClientPlatform":   CLIENT_PLATFORM,
+            "X-Riot-ClientVersion":    client_version,
             "X-Riot-Entitlements-JWT": auth["entitlement_token"],
-            "Authorization":          f"Bearer {auth['access_token']}",
-            "Content-Type":           "application/json",
+            "Authorization":           f"Bearer {auth['access_token']}",
+            "Content-Type":            "application/json",
         }
-        pd = f"https://pd.{shard}.a.pvp.net"
-        puuid = auth["puuid"]
+        pd_url = f"https://pd.{shard}.a.pvp.net"
+        puuid  = auth["puuid"]
 
         shop_r = requests.post(
-            f"{pd}/store/v3/storefront/{puuid}",
+            f"{pd_url}/store/v3/storefront/{puuid}",
             headers=remote_headers,
             json={},
             timeout=15,
@@ -315,31 +469,49 @@ class RiotAPI:
         shop_data = shop_r.json()
 
         wallet_r = requests.get(
-            f"{pd}/store/v1/wallet/{puuid}",
+            f"{pd_url}/store/v1/wallet/{puuid}",
             headers=remote_headers,
             timeout=10,
         )
         wallet_r.raise_for_status()
-        balances = wallet_r.json().get("Balances", {})
+        wallet_raw = wallet_r.json()
 
-        offers_raw = (
-            shop_data
-            .get("SkinsPanelLayout", {})
-            .get("SingleItemStoreOffers", [])
-        )
+        # Case-insensitive lookup for Balances key
+        balances = {}
+        for k, v in wallet_raw.items():
+            if k.lower() == "balances":
+                balances = v
+                break
+
+        panel        = shop_data.get("SkinsPanelLayout", {})
+        level_uuids  = panel.get("SingleItemOffers", [])
+        store_offers = panel.get("SingleItemStoreOffers", [])
+
+        # Build uuid→VP-cost map from the detailed offers list
+        price_map: dict[str, int] = {}
+        for o in store_offers:
+            rewards = o.get("Rewards") or [{}]
+            iid     = rewards[0].get("ItemID", "")
+            price_map[iid] = o.get("Cost", {}).get(VP_ID, 0)
+
+        # If the plain UUID list is empty, fall back to extracting from detailed offers
+        if not level_uuids:
+            level_uuids = list(price_map.keys())
 
         offers = []
-        for offer in offers_raw:
-            item_id  = offer.get("Rewards", [{}])[0].get("ItemID", "")
-            vp_cost  = offer.get("Cost", {}).get(VP_ID, 0)
-            name     = skin_names.get(item_id, f"Unknown ({item_id[:8]}…)")
-            offers.append({"name": name, "vp_cost": vp_cost, "item_id": item_id})
+        for uuid in level_uuids:
+            if not uuid:
+                continue
+            name    = resolve_skin_name(uuid)
+            vp_cost = price_map.get(uuid, 0)
+            offers.append({"name": name, "vp_cost": vp_cost, "item_id": uuid})
 
         return {
-            "offers": offers,
-            "vp":     balances.get(VP_ID, 0),
-            "rad":    balances.get(RADIANITE_ID, 0),
-            "kc":     balances.get(KC_ID, 0),
+            "offers":        offers,
+            "vp":            balances.get(VP_ID, 0),
+            "rad":           balances.get(RADIANITE_ID, 0),
+            "kc":            balances.get(KC_ID, 0),
+            "display_name":  auth.get("display_name", ""),
         }
 
     def find_dm_cid(self, friend_pid: str) -> str:
@@ -397,10 +569,7 @@ def show_toast(root: tk.Tk, name: str, tag: str):
             toast.destroy()
 
     fade_in()
-    try:
-        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-    except Exception:
-        pass
+    _beep()
     toast.after(4000, lambda: fade_out())
 
 
@@ -980,10 +1149,12 @@ class ValASCII(tk.Tk):
             w.destroy()
 
         self._vp_lbl.config(text=f"VP  {data['vp']:,}")
+        name_str = f"  ·  {data['display_name']}" if data.get("display_name") else ""
         self._wallet_lbl.config(
             text=(
                 f"Radianite: {data['rad']:,}  ·  "
                 f"Kingdom Credits: {data['kc']:,}"
+                f"{name_str}"
             )
         )
 
