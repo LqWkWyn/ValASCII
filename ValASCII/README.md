@@ -112,4 +112,4 @@ This file exists only while Riot Client is running. ValASCII reads it automatica
 
 ## Disclaimer
 
-This app uses Riot's **unofficial local API**, which is not publicly supported. It reads data the Riot Client already has on your machine and sends chat messages on your behalf. Use at your own risk.
+This app uses Riot's **unofficial local API**, which is not publicly supported. It reads data the Riot Client already has on your machine and sends chat messages on your behalf. Use at your own risk. Built with APIS from https://valdocs.prometheuz.me/
