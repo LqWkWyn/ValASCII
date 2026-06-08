@@ -42,6 +42,26 @@ LOCKFILE = Path(os.environ.get("LOCALAPPDATA", "")) / \
 
 POLL_INTERVAL = 5  # seconds
 
+# ── Store constants ────────────────────────────────────────────────────────────
+VP_ID         = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
+RADIANITE_ID  = "e59aa87c-4cbf-517a-5983-6e81511be9b7"
+KC_ID         = "85ca954a-00f8-4020-ae71-bf6b0a56f52e"
+# Standard base64 PC client platform string accepted by Riot's remote API
+CLIENT_PLATFORM = (
+    "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0K"
+    "CSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxh"
+    "dGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
+)
+
+SHARD_MAP = {
+    "na": "na", "pbe": "na",
+    "eu": "eu",
+    "ap": "ap",
+    "kr": "kr",
+    "latam": "na",
+    "br": "na",
+}
+
 # ── ASCII Art Library (valoranttextart.com) ────────────────────────────────────
 ASCII_ART = {
     "Gorilla / Monkey": (
@@ -164,6 +184,27 @@ ASCII_ART = {
 }
 
 
+# ── Skin name cache (populated lazily from valorant-api.com) ──────────────────
+_skin_cache: dict[str, str] = {}
+
+
+def get_skin_names() -> dict[str, str]:
+    """Return a uuid→displayName map covering every skin level UUID."""
+    global _skin_cache
+    if _skin_cache:
+        return _skin_cache
+    r = requests.get("https://valorant-api.com/v1/weapons/skins", timeout=15)
+    r.raise_for_status()
+    cache: dict[str, str] = {}
+    for skin in r.json().get("data", []):
+        name = skin["displayName"]
+        cache[skin["uuid"]] = name
+        for level in skin.get("levels", []):
+            cache[level["uuid"]] = name
+    _skin_cache = cache
+    return cache
+
+
 # ── Lockfile / API ─────────────────────────────────────────────────────────────
 
 class LockfileError(Exception):
@@ -217,6 +258,89 @@ class RiotAPI:
         r = self._session.post(f"{self.base}/chat/v6/messages", json=payload)
         r.raise_for_status()
         return r.json()
+
+    def get_auth_info(self) -> dict:
+        """Return accessToken, entitlementToken, and puuid from the local API."""
+        r = self._session.get(f"{self.base}/entitlements/v1/token")
+        r.raise_for_status()
+        d = r.json()
+        return {
+            "access_token":      d["accessToken"],
+            "entitlement_token": d["token"],
+            "puuid":             d["subject"],
+        }
+
+    def get_region(self) -> tuple[str, str]:
+        """Return (region, shard) e.g. ('na', 'na') or ('eu', 'eu')."""
+        r = self._session.get(f"{self.base}/riotclient/region-locale")
+        r.raise_for_status()
+        region = r.json().get("region", "na").lower()
+        return region, SHARD_MAP.get(region, "na")
+
+    def get_shop(self) -> dict:
+        """
+        Fetch the daily store offers.  Returns a dict with:
+          'offers'  – list of {name, vp_cost} dicts (4 items on a normal day)
+          'vp'      – int VP balance
+          'rad'     – int Radianite balance
+          'kc'      – int Kingdom Credits balance
+        Raises on any network or auth error.
+        """
+        auth = self.get_auth_info()
+        region, shard = self.get_region()
+
+        ver_r = requests.get("https://valorant-api.com/v1/version", timeout=10)
+        ver_r.raise_for_status()
+        client_version = ver_r.json()["data"]["riotClientVersion"]
+
+        skin_names = get_skin_names()
+
+        remote_headers = {
+            "X-Riot-ClientPlatform":  CLIENT_PLATFORM,
+            "X-Riot-ClientVersion":   client_version,
+            "X-Riot-Entitlements-JWT": auth["entitlement_token"],
+            "Authorization":          f"Bearer {auth['access_token']}",
+            "Content-Type":           "application/json",
+        }
+        pd = f"https://pd.{shard}.a.pvp.net"
+        puuid = auth["puuid"]
+
+        shop_r = requests.post(
+            f"{pd}/store/v3/storefront/{puuid}",
+            headers=remote_headers,
+            json={},
+            timeout=15,
+        )
+        shop_r.raise_for_status()
+        shop_data = shop_r.json()
+
+        wallet_r = requests.get(
+            f"{pd}/store/v1/wallet/{puuid}",
+            headers=remote_headers,
+            timeout=10,
+        )
+        wallet_r.raise_for_status()
+        balances = wallet_r.json().get("Balances", {})
+
+        offers_raw = (
+            shop_data
+            .get("SkinsPanelLayout", {})
+            .get("SingleItemStoreOffers", [])
+        )
+
+        offers = []
+        for offer in offers_raw:
+            item_id  = offer.get("Rewards", [{}])[0].get("ItemID", "")
+            vp_cost  = offer.get("Cost", {}).get(VP_ID, 0)
+            name     = skin_names.get(item_id, f"Unknown ({item_id[:8]}…)")
+            offers.append({"name": name, "vp_cost": vp_cost, "item_id": item_id})
+
+        return {
+            "offers": offers,
+            "vp":     balances.get(VP_ID, 0),
+            "rad":    balances.get(RADIANITE_ID, 0),
+            "kc":     balances.get(KC_ID, 0),
+        }
 
     def find_dm_cid(self, friend_pid: str) -> str:
         """Return existing DM conversation ID or fall back to friend's pid."""
@@ -331,6 +455,12 @@ class ValASCII(tk.Tk):
                   activebackground=BG_HOVER, activeforeground=TEXT_MAIN,
                   relief="flat", cursor="hand2", padx=10,
                   command=self._try_connect).pack(side="right", padx=(0, 14), pady=8)
+
+        tk.Button(top, text="🛒 SHOP", bg=ACCENT, fg="white",
+                  activebackground=ACCENT_DIM, activeforeground="white",
+                  relief="flat", cursor="hand2", padx=12,
+                  font=("Consolas", 9, "bold"),
+                  command=self._open_shop).pack(side="right", padx=(0, 6), pady=8)
 
         sep = tk.Frame(self, bg=BORDER, height=1)
         sep.pack(fill="x")
@@ -774,6 +904,123 @@ class ValASCII(tk.Tk):
         self._chat_text.config(state="normal")
         self._chat_text.delete("1.0", "end")
         self._chat_text.config(state="disabled")
+
+    # ── Shop window ────────────────────────────────────────────────────────────
+
+    def _open_shop(self):
+        if not self.api:
+            self._chat_append("Not connected — open Riot Client first.\n", tag="system")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Daily Shop")
+        win.configure(bg=BG_DARK)
+        win.geometry("540x420")
+        win.resizable(False, False)
+        win.grab_set()
+
+        # ── header
+        hdr = tk.Frame(win, bg=BG_PANEL, height=48)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="DAILY  ", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Consolas", 13, "bold")).pack(side="left", padx=(16, 0), pady=10)
+        tk.Label(hdr, text="SHOP", bg=BG_PANEL, fg=ACCENT,
+                 font=("Consolas", 13, "bold")).pack(side="left", pady=10)
+
+        self._vp_lbl = tk.Label(hdr, text="", bg=BG_PANEL, fg="#f5d442",
+                                 font=("Consolas", 10, "bold"))
+        self._vp_lbl.pack(side="right", padx=(0, 16))
+
+        refresh_btn = tk.Button(
+            hdr, text="⟳", bg=BG_CARD, fg=TEXT_MAIN,
+            activebackground=BG_HOVER, activeforeground=TEXT_MAIN,
+            relief="flat", cursor="hand2", font=("Consolas", 12),
+            command=lambda: self._fetch_shop(card_grid, refresh_btn),
+        )
+        refresh_btn.pack(side="right", padx=(0, 4), pady=8)
+
+        tk.Frame(win, bg=BORDER, height=1).pack(fill="x")
+
+        # ── skin cards grid
+        card_grid = tk.Frame(win, bg=BG_DARK)
+        card_grid.pack(fill="both", expand=True, padx=14, pady=14)
+        card_grid.columnconfigure(0, weight=1)
+        card_grid.columnconfigure(1, weight=1)
+
+        # ── wallet row
+        tk.Frame(win, bg=BORDER, height=1).pack(fill="x")
+        self._wallet_lbl = tk.Label(win, text="", bg=BG_PANEL, fg=TEXT_DIM,
+                                    font=("Consolas", 8))
+        self._wallet_lbl.pack(fill="x", padx=16, pady=6)
+
+        self._fetch_shop(card_grid, refresh_btn)
+
+    def _fetch_shop(self, card_grid: tk.Frame, refresh_btn: tk.Button):
+        """Fetch shop data in a background thread and populate card_grid."""
+        for w in card_grid.winfo_children():
+            w.destroy()
+
+        spinner = tk.Label(card_grid, text="Fetching shop…",
+                           bg=BG_DARK, fg=TEXT_DIM, font=("Consolas", 10))
+        spinner.grid(row=0, column=0, columnspan=2, pady=40)
+        refresh_btn.config(state="disabled")
+
+        def _worker():
+            try:
+                data = self.api.get_shop()
+                self.after(0, lambda: self._populate_shop(card_grid, refresh_btn, data))
+            except Exception as e:
+                self.after(0, lambda: self._shop_error(card_grid, refresh_btn, str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _populate_shop(self, card_grid: tk.Frame, refresh_btn: tk.Button, data: dict):
+        for w in card_grid.winfo_children():
+            w.destroy()
+
+        self._vp_lbl.config(text=f"VP  {data['vp']:,}")
+        self._wallet_lbl.config(
+            text=(
+                f"Radianite: {data['rad']:,}  ·  "
+                f"Kingdom Credits: {data['kc']:,}"
+            )
+        )
+
+        offers = data["offers"]
+        for idx, offer in enumerate(offers[:4]):
+            row, col = divmod(idx, 2)
+            card = tk.Frame(card_grid, bg=BG_CARD,
+                            highlightthickness=1, highlightbackground=BORDER)
+            card.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+            card_grid.rowconfigure(row, weight=1)
+
+            tk.Label(card, text=offer["name"], bg=BG_CARD, fg=TEXT_MAIN,
+                     font=("Segoe UI", 10, "bold"),
+                     wraplength=210, justify="center").pack(pady=(18, 6))
+
+            price_row = tk.Frame(card, bg=BG_CARD)
+            price_row.pack(pady=(0, 16))
+            tk.Label(price_row, text="VP", bg=BG_CARD, fg="#f5d442",
+                     font=("Consolas", 9, "bold")).pack(side="left", padx=(0, 4))
+            tk.Label(price_row, text=f"{offer['vp_cost']:,}", bg=BG_CARD,
+                     fg=TEXT_MAIN, font=("Consolas", 11, "bold")).pack(side="left")
+
+        if not offers:
+            tk.Label(card_grid, text="No offers found.\nThe store may be unavailable.",
+                     bg=BG_DARK, fg=TEXT_DIM, font=("Consolas", 10),
+                     justify="center").grid(row=0, column=0, columnspan=2, pady=40)
+
+        refresh_btn.config(state="normal")
+
+    def _shop_error(self, card_grid: tk.Frame, refresh_btn: tk.Button, err: str):
+        for w in card_grid.winfo_children():
+            w.destroy()
+        tk.Label(card_grid, text=f"Error loading shop:\n{err}",
+                 bg=BG_DARK, fg=ACCENT, font=("Consolas", 9),
+                 wraplength=480, justify="center").grid(
+                     row=0, column=0, columnspan=2, pady=30)
+        refresh_btn.config(state="normal")
 
     # ── Close ──────────────────────────────────────────────────────────────────
 
